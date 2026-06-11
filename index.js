@@ -6,13 +6,38 @@ const STEAM_COOKIE = process.env.STEAM_COOKIE || "";
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
 
-// Cotação USD→BRL usada apenas no fallback pricehistory (que retorna USD)
-const USD_TO_BRL = 5.85;
+// Cotação USD→BRL com cache de 1 hora
+let cotacaoCache = { valor: 5.85, ts: 0 };
+const COTACAO_TTL = 60 * 60 * 1000; // 1 hora
+
+async function getCotacaoUSDtoBRL() {
+  if (Date.now() - cotacaoCache.ts < COTACAO_TTL) {
+    return cotacaoCache.valor;
+  }
+  try {
+    const res = await fetch("https://open.er-api.com/v6/latest/USD");
+    const data = await res.json();
+    if (data && data.rates && data.rates.BRL) {
+      cotacaoCache = { valor: data.rates.BRL, ts: Date.now() };
+      console.log(`Cotação USD→BRL atualizada: ${data.rates.BRL}`);
+      return data.rates.BRL;
+    }
+  } catch(e) {
+    console.error("Erro ao buscar cotação:", e.message);
+  }
+  return cotacaoCache.valor; // fallback para último valor conhecido
+}
 
 app.use(express.json());
 
-app.get("/", (req, res) => {
-  res.json({ status: "CS2 Price Server online" });
+app.get("/", async (req, res) => {
+  const cotacao = await getCotacaoUSDtoBRL();
+  res.json({ status: "CS2 Price Server online", cotacao_usd_brl: cotacao });
+});
+
+app.get("/cotacao", async (req, res) => {
+  const cotacao = await getCotacaoUSDtoBRL();
+  res.json({ usd_brl: cotacao, atualizado: new Date(cotacaoCache.ts).toISOString() });
 });
 
 app.get("/price", async (req, res) => {
@@ -49,7 +74,7 @@ app.get("/price", async (req, res) => {
     }
   } catch(e) {}
 
-  // 2) Fallback: pricehistory — retorna USD, precisa converter
+  // 2) Fallback: pricehistory — retorna USD, converte para BRL com cotação real
   if (STEAM_COOKIE) {
     try {
       const url = `https://steamcommunity.com/market/pricehistory/?appid=730&market_hash_name=${encodeURIComponent(item)}`;
@@ -59,8 +84,8 @@ app.get("/price", async (req, res) => {
         if (data.success && data.prices && data.prices.length > 0) {
           const last = data.prices[data.prices.length - 1];
           const precoUSD = parseFloat(last[1]);
-          // pricehistory sempre retorna USD — converte para BRL
-          const precoBRL = Math.round(precoUSD * USD_TO_BRL * 100) / 100;
+          const cotacao = await getCotacaoUSDtoBRL();
+          const precoBRL = Math.round(precoUSD * cotacao * 100) / 100;
           const result = {
             item,
             lowest_price: null,
@@ -68,8 +93,9 @@ app.get("/price", async (req, res) => {
             volume: null,
             preco_brl: precoBRL,
             volume_num: null,
-            fonte: "ultimo_negociado_usd_convertido",
-            ultima_negociacao: last[0]
+            fonte: "ultimo_negociado_convertido",
+            ultima_negociacao: last[0],
+            cotacao_usada: cotacao
           };
           cache.set(item, { data: result, ts: Date.now() });
           return res.json(result);
@@ -96,7 +122,6 @@ function buildHeaders() {
 function parseBRL(str) {
   if (!str) return null;
   let clean = str.replace(/R\$\s*/gi, "").trim();
-  // Remove ponto de milhar, troca vírgula decimal por ponto
   if (clean.includes(".") && clean.includes(",")) {
     clean = clean.replace(/\./g, "").replace(",", ".");
   } else if (clean.includes(",")) {
@@ -109,4 +134,5 @@ function parseBRL(str) {
 
 app.listen(PORT, () => {
   console.log(`CS2 Price Server rodando na porta ${PORT}`);
+  getCotacaoUSDtoBRL(); // aquece a cotação no boot
 });
