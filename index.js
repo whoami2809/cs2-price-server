@@ -1,12 +1,13 @@
 const express = require("express");
 const fetch = require("node-fetch");
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const STEAM_COOKIE = process.env.STEAM_COOKIE || "";
-
 const cache = new Map();
 const CACHE_TTL = 10 * 60 * 1000;
+
+// Cotação USD→BRL usada apenas no fallback pricehistory (que retorna USD)
+const USD_TO_BRL = 5.85;
 
 app.use(express.json());
 
@@ -25,20 +26,20 @@ app.get("/price", async (req, res) => {
 
   const headers = buildHeaders();
 
-  // 1) Tenta priceoverview (listagem ativa)
+  // 1) priceoverview com currency=7 (BRL) — retorna R$ direto
   try {
     const url = `https://steamcommunity.com/market/priceoverview/?appid=730&currency=7&market_hash_name=${encodeURIComponent(item)}`;
     const response = await fetch(url, { headers });
-
     if (response.status === 200) {
       const data = await response.json();
       if (data.success && (data.lowest_price || data.median_price)) {
+        const preco = parseBRL(data.lowest_price) || parseBRL(data.median_price);
         const result = {
           item,
           lowest_price: data.lowest_price || null,
           median_price: data.median_price || null,
           volume: data.volume || null,
-          preco_brl: parseBRL(data.lowest_price) || parseBRL(data.median_price),
+          preco_brl: preco,
           volume_num: data.volume ? parseInt(data.volume.replace(/[^0-9]/g, "")) : null,
           fonte: "listagem_ativa"
         };
@@ -48,26 +49,26 @@ app.get("/price", async (req, res) => {
     }
   } catch(e) {}
 
-  // 2) Fallback: pricehistory (último preço negociado)
+  // 2) Fallback: pricehistory — retorna USD, precisa converter
   if (STEAM_COOKIE) {
     try {
       const url = `https://steamcommunity.com/market/pricehistory/?appid=730&market_hash_name=${encodeURIComponent(item)}`;
       const response = await fetch(url, { headers });
-
       if (response.status === 200) {
         const data = await response.json();
         if (data.success && data.prices && data.prices.length > 0) {
-          // Último preço negociado (formato: [data, preco, volume])
           const last = data.prices[data.prices.length - 1];
-          const preco = parseFloat(last[1]);
+          const precoUSD = parseFloat(last[1]);
+          // pricehistory sempre retorna USD — converte para BRL
+          const precoBRL = Math.round(precoUSD * USD_TO_BRL * 100) / 100;
           const result = {
             item,
             lowest_price: null,
             median_price: null,
             volume: null,
-            preco_brl: Math.round(preco * 100) / 100,
+            preco_brl: precoBRL,
             volume_num: null,
-            fonte: "ultimo_negociado",
+            fonte: "ultimo_negociado_usd_convertido",
             ultima_negociacao: last[0]
           };
           cache.set(item, { data: result, ts: Date.now() });
@@ -95,6 +96,7 @@ function buildHeaders() {
 function parseBRL(str) {
   if (!str) return null;
   let clean = str.replace(/R\$\s*/gi, "").trim();
+  // Remove ponto de milhar, troca vírgula decimal por ponto
   if (clean.includes(".") && clean.includes(",")) {
     clean = clean.replace(/\./g, "").replace(",", ".");
   } else if (clean.includes(",")) {
@@ -103,10 +105,6 @@ function parseBRL(str) {
   clean = clean.replace(/[^\d.]/g, "");
   const v = parseFloat(clean);
   return isNaN(v) ? null : v;
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
 }
 
 app.listen(PORT, () => {
